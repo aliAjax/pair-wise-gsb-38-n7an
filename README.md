@@ -15,7 +15,7 @@ python app.py --port 8009
 
 1. 负责人创建项目、字幕版本和术语规则。
 2. 为版本分配 `translator`、`timeline`、`reviewer`。
-3. 翻译或时间轴成员保存字幕；每项包含 `expected_revision`，旧页面提交会返回 409。
+3. 翻译或时间轴成员保存字幕；每项包含 `expected_revision`，旧页面提交会返回 409。也可以整份导入 SRT（`POST /api/versions/{id}/import`）：每块需带序号和 `HH:MM:SS,mmm --> HH:MM:SS,mmm` 时间轴，导入必须携带页面看到的 `expected_revision`；任一块格式错误、时间越界、与现有或文件内字幕重叠、序号冲突或违反术语表，都会整份拒绝并在 `problems` 中列出问题块，原有字幕不受影响；成功返回本次导入条数、字幕总数和新版本号。
 4. 成员可对具体字幕或毫秒时间点添加评论。
 5. 翻译/时间轴成员提交复核，分配的非创建人复核人批准或退回。
 6. 负责人锁定已批准版本，再执行交付。
@@ -32,6 +32,7 @@ python app.py --port 8009
 - `POST /api/projects/{id}/glossary`：设置指定译法和禁用词。
 - `POST /api/versions/{id}/assignments`：分配角色。
 - `POST /api/versions/{id}/cues`：新增或修改字幕，要求 `expected_revision`。
+- `POST /api/versions/{id}/import`：整份导入 SRT 文本，要求 `expected_revision`，全部块通过校验才入库，失败时返回问题块明细。
 - `POST /api/versions/{id}/comments`：按具体时间毫秒或字幕 ID 评论。
 - `POST /api/versions/{id}/submit|review|lock|deliver`：完成审核交付状态机。
 - `GET /api/versions/{id}/cues|comments`、`GET /api/deliveries`：查看结果。

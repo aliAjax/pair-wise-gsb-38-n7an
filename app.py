@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sqlite3
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,9 +22,53 @@ def utcnow() -> str:
 
 
 class DomainError(Exception):
-    def __init__(self, message: str, status: int = 400):
+    def __init__(self, message: str, status: int = 400, details: list[dict[str, Any]] | None = None):
         super().__init__(message)
         self.status = status
+        self.details = details
+
+
+SRT_TIME_RANGE = re.compile(
+    r"^(\d+):([0-5]\d):([0-5]\d)[,.](\d{3})\s*-->\s*(\d+):([0-5]\d):([0-5]\d)[,.](\d{3})$"
+)
+
+
+def _srt_ms(hours: str, minutes: str, seconds: str, millis: str) -> int:
+    return ((int(hours) * 60 + int(minutes)) * 60 + int(seconds)) * 1000 + int(millis)
+
+
+def parse_srt(srt: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split SRT text into cue blocks, collecting per-block format problems.
+
+    Returns (blocks, problems); blocks keep their SRT sequence number as
+    cue_index. Problems reference the sequence number when it could be parsed,
+    otherwise the block's ordinal position in the file.
+    """
+    blocks: list[dict[str, Any]] = []
+    problems: list[dict[str, Any]] = []
+    chunks = re.split(r"\r?\n[ \t]*\r?\n", srt.lstrip("﻿").strip())
+    for position, chunk in enumerate(chunks, start=1):
+        lines = [line for line in (raw.strip() for raw in chunk.splitlines()) if line]
+        if len(lines) < 3:
+            problems.append({"block": position, "reason": "块格式不完整，需要序号、时间轴和字幕内容"})
+            continue
+        try:
+            cue_index = int(lines[0])
+        except ValueError:
+            problems.append({"block": position, "reason": f"序号不是整数: {lines[0]}"})
+            continue
+        match = SRT_TIME_RANGE.match(lines[1])
+        if not match:
+            problems.append({"block": cue_index, "reason": f"时间轴格式错误: {lines[1]}"})
+            continue
+        start_ms = _srt_ms(*match.group(1, 2, 3, 4))
+        end_ms = _srt_ms(*match.group(5, 6, 7, 8))
+        text = "\n".join(lines[2:]).strip()
+        if not text:
+            problems.append({"block": cue_index, "reason": "字幕内容为空"})
+            continue
+        blocks.append({"cue_index": cue_index, "start_ms": start_ms, "end_ms": end_ms, "text": text})
+    return blocks, problems
 
 
 class Database:
@@ -236,17 +281,24 @@ class Database:
             return True
         return bool(conn.execute("SELECT 1 FROM assignments WHERE version_id=? AND user=? AND role IN ('translator','timeline')", (version["id"], actor)).fetchone())
 
-    def _validate_glossary(self, conn: sqlite3.Connection, project_id: int, text: str) -> None:
+    def _glossary_errors(self, conn: sqlite3.Connection, project_id: int, text: str) -> list[str]:
+        errors: list[str] = []
         for row in conn.execute("SELECT * FROM glossaries WHERE project_id=?", (project_id,)):
             forbidden = json.loads(row["forbidden_terms"])
             for term in forbidden:
                 if term and term in text:
-                    raise DomainError(f"字幕包含禁用译法: {term}")
+                    errors.append(f"字幕包含禁用译法: {term}")
             # The glossary is enforced only when the corresponding source term
             # appears in the localized cue. This keeps it useful without making
             # every cue repeat every glossary word.
             if row["source_term"] in text and row["required_translation"] not in text:
-                raise DomainError(f"术语 {row['source_term']} 必须使用指定译法 {row['required_translation']}")
+                errors.append(f"术语 {row['source_term']} 必须使用指定译法 {row['required_translation']}")
+        return errors
+
+    def _validate_glossary(self, conn: sqlite3.Connection, project_id: int, text: str) -> None:
+        errors = self._glossary_errors(conn, project_id, text)
+        if errors:
+            raise DomainError(errors[0])
 
     def save_cue(self, version_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
         with self.connect() as conn:
@@ -294,6 +346,75 @@ class Database:
             conn.execute("UPDATE versions SET revision=?,updated_at=? WHERE id=?", (revision, utcnow(), version_id))
             self._audit(conn, actor, "cue.saved", "version", version_id, {"cue_id": saved_id, "revision": revision})
         return dict(conn.execute("SELECT * FROM cues WHERE id=?", (saved_id,)).fetchone()) | {"version_revision": revision}
+
+    def import_srt(self, version_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
+        srt = payload.get("srt")
+        if not isinstance(srt, str) or not srt.strip():
+            raise DomainError("SRT 内容不能为空")
+        expected = payload.get("expected_revision")
+        if expected is None:
+            raise DomainError("导入必须携带页面看到的版本号 expected_revision")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            version = self._version(conn, version_id)
+            if version["status"] != "draft":
+                raise DomainError("只有草稿版本可以导入字幕", 409)
+            if not self._can_edit(conn, version, actor):
+                raise DomainError("没有该版本的翻译或时间轴权限", 403)
+            try:
+                expected_no = int(expected)
+            except (TypeError, ValueError) as exc:
+                raise DomainError("版本号必须是整数") from exc
+            if expected_no != int(version["revision"]):
+                raise DomainError("版本已被其他成员修改，请刷新后重试", 409)
+            blocks, problems = parse_srt(srt)
+            duration_ms = int(version["duration_ms"])
+            project_id = int(version["project_id"])
+            seen_indexes: set[int] = set()
+            valid: list[dict[str, Any]] = []
+            for block in blocks:
+                label = block["cue_index"]
+                before = len(problems)
+                if block["cue_index"] < 0:
+                    problems.append({"block": label, "reason": "序号不能为负数"})
+                if block["end_ms"] <= block["start_ms"]:
+                    problems.append({"block": label, "reason": "时间轴起点必须早于终点"})
+                elif block["end_ms"] > duration_ms:
+                    problems.append({"block": label, "reason": f"时间越界：超出成片时长 {duration_ms}ms"})
+                if block["cue_index"] in seen_indexes:
+                    problems.append({"block": label, "reason": "序号在文件内重复"})
+                seen_indexes.add(block["cue_index"])
+                for reason in self._glossary_errors(conn, project_id, block["text"]):
+                    problems.append({"block": label, "reason": reason})
+                hit = conn.execute(
+                    "SELECT cue_index FROM cues WHERE version_id=? AND start_ms<? AND end_ms>? LIMIT 1",
+                    (version_id, block["end_ms"], block["start_ms"]),
+                ).fetchone()
+                if hit:
+                    problems.append({"block": label, "reason": f"与现有字幕 #{hit['cue_index']} 时间轴重叠"})
+                if conn.execute("SELECT 1 FROM cues WHERE version_id=? AND cue_index=?", (version_id, block["cue_index"])).fetchone():
+                    problems.append({"block": label, "reason": "序号已被现有字幕使用"})
+                if len(problems) == before:
+                    valid.append(block)
+            previous: dict[str, Any] | None = None
+            for block in sorted(valid, key=lambda b: (b["start_ms"], b["end_ms"])):
+                if previous and block["start_ms"] < previous["end_ms"]:
+                    problems.append({"block": block["cue_index"], "reason": f"与块 {previous['cue_index']} 时间轴重叠"})
+                if previous is None or block["end_ms"] > previous["end_ms"]:
+                    previous = block
+            if problems:
+                raise DomainError(f"SRT 导入被拒绝，{len(problems)} 个问题块，整份未入库", details=problems)
+            now = utcnow()
+            for block in blocks:
+                conn.execute(
+                    "INSERT INTO cues(version_id,cue_index,start_ms,end_ms,text,updated_by,updated_at) VALUES(?,?,?,?,?,?,?)",
+                    (version_id, block["cue_index"], block["start_ms"], block["end_ms"], block["text"], actor, now),
+                )
+            revision = int(version["revision"]) + 1
+            conn.execute("UPDATE versions SET revision=?,updated_at=? WHERE id=?", (revision, now, version_id))
+            cue_count = int(conn.execute("SELECT COUNT(*) AS c FROM cues WHERE version_id=?", (version_id,)).fetchone()["c"])
+            self._audit(conn, actor, "cues.imported", "version", version_id, {"imported": len(blocks), "revision": revision})
+            return {"version_id": version_id, "imported": len(blocks), "cue_count": cue_count, "version_revision": revision}
 
     def add_comment(self, version_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
         body = str(payload.get("body", "")).strip()
@@ -453,6 +574,13 @@ class Handler(BaseHTTPRequestHandler):
     def _auth(self) -> tuple[str, str]:
         return self.headers.get("X-User", "anonymous"), self.headers.get("X-Role", "viewer")
 
+    def _error(self, exc: Exception) -> None:
+        payload: dict[str, Any] = {"error": str(exc)}
+        details = getattr(exc, "details", None)
+        if details:
+            payload["problems"] = details
+        self._send(payload, getattr(exc, "status", 400))
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         try:
@@ -475,7 +603,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send({"comments": self.db.list_comments(int(parts[2]))})
             raise DomainError("接口不存在", 404)
         except (ValueError, DomainError) as exc:
-            self._send({"error": str(exc)}, getattr(exc, "status", 400))
+            self._error(exc)
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
@@ -493,6 +621,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(self.db.assign(int(parts[2]), actor, body, role), 201)
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "cues":
                 return self._send(self.db.save_cue(int(parts[2]), actor, body, role), 201)
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "import":
+                return self._send(self.db.import_srt(int(parts[2]), actor, body, role), 201)
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "comments":
                 return self._send(self.db.add_comment(int(parts[2]), actor, body, role), 201)
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] in {"submit", "lock", "deliver"}:
@@ -506,7 +636,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(self.db.review(int(parts[2]), actor, body, role))
             raise DomainError("接口不存在", 404)
         except (ValueError, TypeError, DomainError) as exc:
-            self._send({"error": str(exc)}, getattr(exc, "status", 400))
+            self._error(exc)
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"[subtitle] {self.address_string()} - {fmt % args}")
